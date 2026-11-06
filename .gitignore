@@ -1,0 +1,13 @@
+# ── RAHASIA — jangan pernah di-push ──
+panel.json
+*.session
+*.session-journal
+instances/
+
+# ── log & runtime ──
+*.log
+logs/
+__pycache__/
+*.pyc
+.pm2/
+node_modules/

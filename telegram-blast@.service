@@ -1,0 +1,15 @@
+[Unit]
+Description=Telegram Blast instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/telegram-bot
+ExecStart=/usr/bin/python3 /root/telegram-bot/bot.py --instance %i
+Restart=always
+RestartSec=15
+Environment=TERM=xterm
+
+[Install]
+WantedBy=multi-user.target
