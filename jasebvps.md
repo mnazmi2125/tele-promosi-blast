@@ -36,7 +36,7 @@ pm2 start ecosystem.config.js && pm2 save
 
 ### Menu panel
 
-| Tombol | Fungsi |
+| Tombgol | Funsi |
 |---|---|
 | ▸ Akun | Pilih akun aktif (lihat status ●/○) |
 | ▸ Grup | Pilih grup pakai tombol centang (paginasi) |

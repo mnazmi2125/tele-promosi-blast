@@ -296,6 +296,8 @@ def layar_grup(uid):
         if hal < total_hal - 1:
             nav.append(Button.inline('▶', b'grup:nav:1'))
         tomb.append(nav)
+    tomb.append([Button.inline('✅ Pilih Semua', b'grup:semua'),
+                 Button.inline('⬜ Kosongkan', b'grup:kosong')])
     tomb.append([Button.inline(f'💾 Simpan ({len(sel)})', b'grup:simpan'),
                  Button.inline('⟳ Muat Ulang', b'grup:muat')])
     tomb.append([Button.inline('◀ Kembali', b'utama')])
@@ -598,6 +600,15 @@ async def tangani_klik(uid, data):
                 sel.discard(gid)
             else:
                 sel.add(gid)
+            return layar_grup(uid)
+        if parts[1] == 'semua':
+            lst = st.get('grup_list', [])
+            st['terpilih'] = {gid for gid, _n, _t in lst}
+            st['info'] = f'✅ Semua grup dipilih ({len(st["terpilih"])})'
+            return layar_grup(uid)
+        if parts[1] == 'kosong':
+            st['terpilih'] = set()
+            st['info'] = '⬜ Pilihan dikosongkan'
             return layar_grup(uid)
         if parts[1] == 'nav':
             if parts[2] != '0':
