@@ -387,16 +387,43 @@ def terkunci(nama):
 
 # ────────────────────────── tambah akun (login dari chat) ──────────────────────────
 
-def nama_akun_baru():
-    ada = set(daftar_akun())
-    n = 1
-    while f'akun{n}' in ada:
-        n += 1
-    return f'akun{n}'
+def validasi_nama_akun(nama):
+    """Kembalikan pesan error, atau None kalau nama valid.
+
+    Nama dipakai sebagai nama file (instances/<nama>.json dan <nama>.session)
+    sekaligus ditampilkan di pesan panel, jadi karakternya dibatasi.
+    """
+    if not nama:
+        return 'Nama kosong.'
+    if len(nama) > 30:
+        return 'Nama terlalu panjang — maksimal 30 karakter.'
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9\-(). ]*', nama):
+        return ('Nama hanya boleh huruf, angka, spasi, titik, strip, dan kurung.\n'
+                'Harus diawali huruf/angka dan tanpa karakter khusus (_, *, #, dsb).')
+    if nama.lower() in {a.lower() for a in daftar_akun()}:
+        return f'Nama "{nama}" sudah dipakai akun lain.'
+    if os.path.exists(os.path.join(BASE_DIR, nama + '.session')):
+        return f'Nama "{nama}" masih punya file session lama — pilih nama lain.'
+    return None
 
 
 async def proses_login(uid, ev, text, st):
     tahap = st.get('tahap')
+
+    if tahap == 'nama':
+        nama = re.sub(r'\s+', ' ', text).strip()
+        salah = validasi_nama_akun(nama)
+        if salah:
+            await ev.respond(f'❌ {salah}\n\nKetik ulang nama akun:')
+            return
+        st['nama'] = nama
+        st['tahap'] = 'phone'
+        await ev.respond(
+            f'✅ Nama "{nama}" dipakai.\n\n'
+            'Ketik nomor HP akun Telegram baru\n'
+            '(format +628xxxx, kode dikirim ke akun itu):')
+        return
+
     if tahap == 'phone':
         phone = text.strip()
         if not phone.startswith('+'):
@@ -725,9 +752,13 @@ async def tangani_klik(uid, data):
     # ── tambah akun ──
     if cmd == 'tambah':
         if parts[1] == 'mulai':
-            st.update({'flow': 'login', 'tahap': 'phone', 'nama': nama_akun_baru()})
-            return (f'➕ TAMBAH AKUN — akan dibuat sebagai "{st["nama"]}"\n\n'
-                    'Ketik nomor HP akun Telegram baru\n(format +628xxxx, kode dikirim ke akun itu):',
+            st.update({'flow': 'login', 'tahap': 'nama', 'nama': None,
+                       'client': None, 'phone': None})
+            return ('➕ TAMBAH AKUN\n\n'
+                    'Ketik NAMA untuk akun baru\n'
+                    '(contoh: jualan, akun kedua, marketing)\n'
+                    'Nama ini hanya untuk mengenali akun di panel.\n'
+                    'Boleh huruf, angka, spasi, titik, strip, kurung.',
                     [[Button.inline('❌ Batal', b'tambah:batal')]])
         if parts[1] == 'batal':
             if st.get('client'):
@@ -735,7 +766,8 @@ async def tangani_klik(uid, data):
                     await st['client'].disconnect()
                 except Exception:
                     pass
-            st.update({'flow': None, 'tahap': None, 'client': None})
+            st.update({'flow': None, 'tahap': None, 'client': None,
+                       'nama': None, 'phone': None})
             return layar_utama(uid)
 
     return layar_utama(uid)
