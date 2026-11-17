@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta
 
 from telethon import TelegramClient, Button, events
@@ -30,19 +31,32 @@ from telethon.errors import (
 
 from bot import (
     BASE_DIR, INSTANCES_DIR, log, path_instance, terapkan_default, save_instance,
-    resolve_groups, siapkan_pesan, loop_kirim, hitung_delay,
+    resolve_groups, siapkan_pesan, loop_kirim, hitung_delay, kirim_tanpa_tunggu,
     parse_telegram_link, tipe_grup,
 )
 
 PANEL_FILE = os.path.join(BASE_DIR, 'panel.json')
+ROTASI_FILE = os.path.join(BASE_DIR, 'rotasi.json')
 MEDIA_DIR = os.path.join(BASE_DIR, 'media')
 PER_HALAMAN = 20
+
+# Config mode rotasi — sengaja dipisah dari panel.json supaya code tidak
+# pernah menulis ulang file yang berisi bot_token.
+ROTASI_DEFAULT = {
+    'delay_rotasi': 600,   # jeda antar giliran akun, dalam detik
+    'durasi_jam': 0,       # 0 = selamanya
+    'running': False,
+    'mulai': None,         # unix time rotasi dimulai (buat hitung sisa durasi)
+    'giliran': None,       # akun yang mendapat giliran BERIKUTNYA
+    'flood_until': {},     # nama akun -> unix time selesai cooldown flood
+}
 
 PANEL = {}
 ADMIN_IDS = []
 BOT = None
 AKUN = {}   # nama -> {task, client, siklus, kirim, terakhir, hasil, next}
 STATE = {}  # uid -> {akun, flow, tahap, nama, phone, client, grup_list, terpilih, halaman, info}
+ROTASI_TASK = {'task': None}
 
 
 # ────────────────────────── util instance/akun ──────────────────────────
@@ -156,6 +170,8 @@ async def dapatkan_client(nama):
 
 
 async def mulai_blast(nama):
+    if rotasi_berjalan():
+        return False, '🔄 Rotasi sedang berjalan — hentikan dulu di menu ⚙ Mode.'
     if berjalan(nama):
         return False, f'{nama} sudah berjalan.'
     cfg = baca(nama)
@@ -224,6 +240,13 @@ async def jalankan_engine(nama, client, groups, pesan, cfg, forward):
 
 
 async def resume_berjalan():
+    # Rotasi dulu — kalau sebelumnya menyala waktu PM2 restart
+    try:
+        if baca_rotasi().get('running'):
+            ok, msg = await mulai_rotasi(resume=True)
+            await notif(msg if ok else f'⚠️ Resume rotasi gagal: {msg}')
+    except Exception as e:
+        log('ERROR', f'Resume rotasi gagal: {e}')
     for nama in daftar_akun():
         try:
             if baca(nama).get('running'):
@@ -234,6 +257,290 @@ async def resume_berjalan():
             await notif(f'⚠️ Resume {nama} gagal: {e}')
 
 
+# ────────────────────────── mode rotasi (giliran antar akun) ──────────────────────────
+
+def baca_rotasi():
+    """Baca rotasi.json. File boleh belum ada / rusak -> pakai default."""
+    cfg = dict(ROTASI_DEFAULT)
+    if os.path.exists(ROTASI_FILE):
+        try:
+            with open(ROTASI_FILE, 'r') as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            log('WARN', f'rotasi.json tidak terbaca ({e}) -> pakai default')
+    if not isinstance(cfg.get('flood_until'), dict):
+        cfg['flood_until'] = {}
+    return cfg
+
+
+def simpan_rotasi(cfg):
+    with open(ROTASI_FILE, 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+
+def rotasi_berjalan():
+    t = ROTASI_TASK.get('task')
+    return t is not None and not t.done()
+
+
+def txt_detik(d):
+    d = int(d or 0)
+    if d < 60:
+        return f'{d} detik'
+    if d < 3600:
+        return f'{d // 60} menit'
+    return f'{d // 3600} jam'
+
+
+def txt_jam(j):
+    j = float(j or 0)
+    return 'selamanya' if j <= 0 else f'{j:g} jam'
+
+
+def sisa_durasi_rotasi(cfg):
+    """Sisa waktu rotasi (detik). None = tanpa batas. <= 0 = sudah habis."""
+    jam = float(cfg.get('durasi_jam', 0) or 0)
+    if jam <= 0:
+        return None
+    mulai = cfg.get('mulai')
+    if not mulai:
+        return None
+    return (float(mulai) + jam * 3600) - time.time()
+
+
+def kandidat_layak(nama, cfg_rotasi):
+    """Akun boleh dapat giliran kalau: config terbaca, grup terpilih,
+    file session ada, dan sedang tidak cooldown flood."""
+    try:
+        cfg = baca(nama)
+    except Exception:
+        return False
+    if not cfg.get('grup'):
+        return False
+    try:
+        if not os.path.exists(path_session(cfg, nama) + '.session'):
+            return False
+    except Exception:
+        return False
+    until = float((cfg_rotasi.get('flood_until') or {}).get(nama, 0) or 0)
+    return time.time() >= until
+
+
+async def grup_rotasi(nama, client, cfg):
+    """resolve_groups + cache, supaya get_dialogs() tidak dipanggil tiap giliran."""
+    st = entri_akun(nama)
+    kunci = tuple(cfg.get('grup') or [])
+    if st.get('grup_kunci') == kunci and st.get('grup_cache') is not None:
+        return st['grup_cache']
+    groups = await resolve_groups(client, cfg['grup'])
+    st['grup_kunci'] = kunci
+    st['grup_cache'] = groups
+    return groups
+
+
+async def satu_giliran(nama):
+    """Kirim 1 siklus untuk akun ini — semua grup dikirim BERSAMAAN.
+
+    Mengembalikan (flood_detik, terkirim, total_grup).
+    """
+    cfg = baca(nama)
+    client = await dapatkan_client(nama)
+    groups = await grup_rotasi(nama, client, cfg)
+    if not groups:
+        return 0, 0, 0
+    pesan, forward = await siapkan_pesan(client, cfg)
+    mode_forward = cfg['mode'] == 'forward'
+
+    hasil = await asyncio.gather(
+        *[kirim_tanpa_tunggu(client, g, pesan, forward, mode_forward) for g in groups]
+    )
+    flood = max([d for s, d in hasil if s == 'flood'], default=0)
+    ok = sum(1 for s, _ in hasil if s == 'ok')
+
+    st = entri_akun(nama)
+    st['siklus'] = int(st.get('siklus', 0)) + 1
+    st['kirim'] = int(st.get('kirim', 0)) + ok
+    st['terakhir'] = datetime.now().strftime('%H:%M')
+    st['hasil'] = f'{ok}/{len(hasil)}'
+    st['next'] = datetime.now() + timedelta(seconds=int(baca_rotasi().get('delay_rotasi', 600) or 0))
+    return flood, ok, len(hasil)
+
+
+async def jalankan_rotasi():
+    """Engine rotasi: akun1 -> tunggu delay -> akun2 -> ... -> balik ke akun1.
+
+    Tiap giliran = 1 siklus penuh (kirim ke SEMUA grup akun itu, paralel).
+    Kalau kena FloodWait: akun langsung di-cooldown, giliran LANJUT ke akun
+    berikutnya tanpa menunggu delay. Grup yang gagal otomatis terkirim ulang
+    pada giliran berikutnya akun tersebut (karena tiap giliran selalu kirim
+    ke semua grup).
+    """
+    flood_berturut = 0
+    gagal = set()   # akun yang config-nya bermasalah (pesan kosong dkk)
+
+    try:
+        while True:
+            cfg_r = baca_rotasi()
+            if not cfg_r.get('running'):
+                log('INFO', 'Rotasi dimatikan.')
+                await notif('🔄 Rotasi dimatikan.')
+                break
+
+            sisa = sisa_durasi_rotasi(cfg_r)
+            if sisa is not None and sisa <= 0:
+                log('INFO', 'Durasi rotasi habis.')
+                await notif('⏰ Durasi rotasi habis — blast dihentikan.')
+                break
+
+            akun = daftar_akun()
+            if not akun:
+                log('WARN', 'Rotasi berhenti: tidak ada akun.')
+                await notif('⚠️ Rotasi berhenti: tidak ada akun.')
+                break
+
+            # ── pilih akun berikutnya yang layak ──
+            giliran = cfg_r.get('giliran')
+            idx = akun.index(giliran) if giliran in akun else 0
+            nama = None
+            for _ in range(len(akun)):
+                kandidat = akun[idx]
+                idx = (idx + 1) % len(akun)
+                if kandidat not in gagal and kandidat_layak(kandidat, cfg_r):
+                    nama = kandidat
+                    break
+
+            if nama is None:
+                if all(n in gagal for n in akun):
+                    log('ERROR', 'Rotasi berhenti: semua akun bermasalah.')
+                    await notif('⚠️ Rotasi berhenti: semua akun bermasalah (cek Grup & Pesan).')
+                    break
+                # semua akun sedang cooldown flood -> tunggu yang paling dekat
+                now = time.time()
+                cooldown = [float(v) - now for v in (cfg_r.get('flood_until') or {}).values()
+                            if float(v) > now]
+                tunggu = int(min(cooldown)) + 1 if cooldown else 60
+                log('INFO', f'Tidak ada akun siap -> tunggu {tunggu}s')
+                await asyncio.sleep(tunggu)
+                continue
+
+            # catat giliran berikutnya (urutan tetap & tersimpan saat restart)
+            cfg_r['giliran'] = akun[idx]
+            simpan_rotasi(cfg_r)
+
+            # ── jalankan 1 giliran ──
+            try:
+                flood, ok, total = await satu_giliran(nama)
+            except asyncio.CancelledError:
+                raise
+            except ValueError as e:
+                # pesan belum diisi / config tidak lengkap -> akun dilewati
+                log('ERROR', f'{nama} tidak bisa jalan: {e}')
+                await notif(f'⚠️ Rotasi melewati {nama}: {e}')
+                gagal.add(nama)
+                continue
+            except Exception as e:
+                log('ERROR', f'Giliran {nama} gagal: {e}')
+                await notif(f'⚠️ Rotasi: {nama} gagal -> {e}')
+                await asyncio.sleep(30)
+                continue
+
+            log('INFO', f'Giliran {nama} selesai: {ok}/{total} terkirim'
+                        + (f' | FLOOD {flood}s' if flood else ''))
+
+            if flood:
+                # kunci akun ini sampai floodwait habis, langsung pindah akun
+                cfg_r = baca_rotasi()
+                cfg_r.setdefault('flood_until', {})[nama] = time.time() + flood
+                simpan_rotasi(cfg_r)
+                flood_berturut += 1
+                if flood_berturut >= len(akun):
+                    log('WARN', f'{flood_berturut} akun berturut-turut kena flood -> jeda 60 detik')
+                    flood_berturut = 0
+                    await asyncio.sleep(60)
+                continue
+
+            flood_berturut = 0
+            delay = int(cfg_r.get('delay_rotasi', 600) or 0)
+            if delay > 0:
+                log('INFO', f'Tunggu {txt_detik(delay)} sebelum giliran berikutnya...')
+                await asyncio.sleep(delay)
+
+    except asyncio.CancelledError:
+        await notif('⏹ Rotasi dihentikan.')
+    except Exception as e:
+        log('ERROR', f'Engine rotasi error: {e}')
+        await notif(f'⚠️ Rotasi error: {e}')
+    finally:
+        ROTASI_TASK['task'] = None
+        try:
+            c = baca_rotasi()
+            c['running'] = False
+            simpan_rotasi(c)
+        except Exception:
+            pass
+
+
+async def mulai_rotasi(resume=False):
+    if rotasi_berjalan():
+        return False, 'Rotasi sudah berjalan.'
+    akun = daftar_akun()
+    if not akun:
+        return False, 'Belum ada akun.'
+    if any(berjalan(n) for n in akun):
+        return False, 'Ada akun masih jalan mode paralel — STOP dulu.'
+
+    cfg_r = baca_rotasi()
+    layak = [n for n in akun if kandidat_layak(n, cfg_r)]
+    if not layak:
+        return False, 'Tidak ada akun yang siap (cek menu Grup & session).'
+
+    # pastikan pesan tiap akun valid, supaya tidak error di tengah jalan
+    for n in layak:
+        try:
+            c = await dapatkan_client(n)
+            await siapkan_pesan(c, baca(n))
+        except Exception as e:
+            return False, f'{n} tidak siap: {e}'
+
+    cfg_r['running'] = True
+    if cfg_r.get('giliran') not in akun:
+        cfg_r['giliran'] = akun[0]
+    if not resume or not cfg_r.get('mulai'):
+        cfg_r['mulai'] = time.time()
+    simpan_rotasi(cfg_r)
+
+    ROTASI_TASK['task'] = asyncio.create_task(jalankan_rotasi())
+    return True, f'🔄 Rotasi dimulai ({len(akun)} akun, jeda {txt_detik(cfg_r["delay_rotasi"])}).'
+
+
+def hentikan_rotasi():
+    t = ROTASI_TASK.get('task')
+    if t and not t.done():
+        t.cancel()
+        try:
+            c = baca_rotasi()
+            c['running'] = False
+            simpan_rotasi(c)
+        except Exception:
+            pass
+        return True
+    return False
+
+
+async def proses_modedelay(uid, ev, text, st):
+    angka = re.sub(r'[^0-9]', '', text or '')
+    if not angka:
+        await ev.respond('❌ Masukkan angka MENIT (contoh: 45):')
+        return
+    cfg_r = baca_rotasi()
+    cfg_r['delay_rotasi'] = int(angka) * 60
+    simpan_rotasi(cfg_r)
+    st.update({'flow': None, 'info': f'Delay rotasi: {angka} menit'})
+    teks, tomb = layar_mode(uid)
+    await ev.respond('✅ Delay rotasi disimpan.', buttons=tomb)
+    await ev.respond(teks, buttons=tomb)
+
+
 # ────────────────────────── layar / tombol ──────────────────────────
 
 def layar_utama(uid):
@@ -242,15 +549,25 @@ def layar_utama(uid):
         return ('🎛 PANEL KONTROL BLAST\n\nBelum ada akun. Tap ➕ Tambah Akun untuk login akun pertama.',
                 [[Button.inline('➕ Tambah Akun', b'tambah:mulai')]])
     info = ambil_info(uid)
-    status = '🟢 Berjalan' if berjalan(nama) else '⏹ Berhenti'
+    jalan = berjalan(nama)
+    roto = rotasi_berjalan()
+    if jalan:
+        status = '🟢 Berjalan'
+    elif roto:
+        status = '🔄 Berjalan (rotasi)'
+    else:
+        status = '⏹ Berhenti'
     teks = f'🎛 PANEL KONTROL BLAST\n\nAkun aktif: {nama}\nStatus: {status}'
+    if roto:
+        teks += f'\nGiliran: {baca_rotasi().get("giliran") or "-"}'
     if info:
         teks += f'\nℹ️ {info}'
-    aksi = Button.inline('⏹ STOP', b'main:stop') if berjalan(nama) else Button.inline('▶ MULAI', b'main:open')
+    aksi = Button.inline('⏹ STOP', b'main:stop') if (jalan or roto) else Button.inline('▶ MULAI', b'main:open')
     tomb = [
         [Button.inline('▸ Akun', b'akun:list'), Button.inline('▸ Grup', b'grup:open')],
         [Button.inline('▸ Pesan', b'pesan:open'), Button.inline('▸ Delay & Durasi', b'delay:open')],
         [aksi, Button.inline('📊 Status', b'status')],
+        [Button.inline('⚙ Mode', b'mode:open')],
         [Button.inline('➕ Tambah Akun', b'tambah:mulai')],
     ]
     return teks, tomb
@@ -365,24 +682,89 @@ def layar_konfirmasi(uid):
 
 def layar_status(uid):
     info = ambil_info(uid)
+    cfg_r = baca_rotasi() if rotasi_berjalan() else None
     teks = '📊 STATUS'
+    if cfg_r is not None:
+        teks += (f'\n🔄 Mode: Rotasi (giliran: {cfg_r.get("giliran") or "-"})'
+                 f'\n   Delay {txt_detik(cfg_r.get("delay_rotasi"))} | '
+                 f'Durasi {txt_jam(cfg_r.get("durasi_jam"))}')
     if info:
         teks += f'\nℹ️ {info}'
     for nama in daftar_akun():
         st = AKUN.get(nama) or {}
         if berjalan(nama):
-            baris = (f'\n\n🟢 {nama}\n   Siklus #{st["siklus"]} | terakhir {st["hasil"]} @ {st["terakhir"]}'
-                     f'\n   Total terkirim: {st["kirim"]}')
+            baris = (f'\n\n🟢 {nama}\n   Siklus #{st.get("siklus", 0)} | terakhir {st.get("hasil", "-")} @ {st.get("terakhir", "-")}'
+                     f'\n   Total terkirim: {st.get("kirim", 0)}')
             if st.get('next'):
                 baris += f'\n   Siklus berikutnya ~ {st["next"].strftime("%H:%M")}'
+        elif cfg_r is not None:
+            gilir = '▶ GILIRAN' if nama == cfg_r.get('giliran') else '⏸ menunggu'
+            baris = (f'\n\n🔄 {nama} — {gilir}\n   Siklus #{st.get("siklus", 0)} | terakhir {st.get("hasil", "-")} @ {st.get("terakhir", "-")}'
+                     f'\n   Total terkirim: {st.get("kirim", 0)}')
+            until = float((cfg_r.get('flood_until') or {}).get(nama, 0) or 0)
+            if until > time.time():
+                baris += f'\n   🧊 Flood cooldown {int(until - time.time())}s'
         else:
             baris = f'\n\n⏹ {nama}: berhenti'
         teks += baris
     return (teks, [[Button.inline('◀ Kembali', b'utama')]])
 
 
+def layar_mode(uid):
+    cfg_r = baca_rotasi()
+    info = ambil_info(uid)
+    akun = daftar_akun()
+    jalan = rotasi_berjalan()
+    paralel = any(berjalan(n) for n in akun)
+
+    if jalan:
+        mode_txt = '🔄 Rotasi — BERJALAN'
+    elif paralel:
+        mode_txt = '⚡ Paralel — BERJALAN'
+    else:
+        mode_txt = '⏸ Berhenti'
+
+    teks = f'⚙ MODE\n\nMode: {mode_txt}'
+    teks += f'\nAkun         : {len(akun)}'
+    teks += f'\nDelay rotasi : {txt_detik(cfg_r.get("delay_rotasi"))}'
+    teks += f'\nDurasi       : {txt_jam(cfg_r.get("durasi_jam"))}'
+    if jalan:
+        teks += f'\nGiliran      : {cfg_r.get("giliran") or "-"}'
+        now = time.time()
+        cooling = [f'{n} ({int(float(v) - now)}s)'
+                   for n, v in (cfg_r.get('flood_until') or {}).items()
+                   if float(v) > now]
+        if cooling:
+            teks += f'\n🧊 Cooldown   : {", ".join(cooling)}'
+    if info:
+        teks += f'\nℹ️ {info}'
+
+    tomb = []
+    if jalan:
+        tomb.append([Button.inline('⏹ Hentikan Rotasi', b'mode:stop')])
+    elif paralel:
+        tomb.append([Button.inline('⚡ Paralel aktif — STOP dulu', b'utama')])
+    else:
+        tomb.append([Button.inline('🔄 Mulai Rotasi', b'mode:start')])
+    tomb.append([
+        Button.inline('30 mnt', b'mode:set:30'),
+        Button.inline('45 mnt', b'mode:set:45'),
+        Button.inline('60 mnt', b'mode:set:60'),
+    ])
+    tomb.append([Button.inline('⌨ Custom Delay (menit)', b'mode:custom')])
+    tomb.append([
+        Button.inline('∞ Selamanya', b'mode:durasi:0'),
+        Button.inline('24 jam', b'mode:durasi:24'),
+        Button.inline('30 hari', b'mode:durasi:720'),
+    ])
+    tomb.append([Button.inline('◀ Kembali', b'utama')])
+    return teks, tomb
+
+
 def terkunci(nama):
-    return berjalan(nama)
+    # Selama rotasi berjalan, semua akun dianggap terkunci karena bisa saja
+    # mendapat giliran kapan saja.
+    return berjalan(nama) or rotasi_berjalan()
 
 
 # ────────────────────────── tambah akun (login dari chat) ──────────────────────────
@@ -497,6 +879,10 @@ async def proses_input(uid, ev, text):
 
     if flow == 'login':
         await proses_login(uid, ev, text, st)
+        return
+
+    if flow == 'modedelay':
+        await proses_modedelay(uid, ev, text, st)
         return
 
     nama = akun_aktif(uid)
@@ -725,6 +1111,9 @@ async def tangani_klik(uid, data):
     # ── mulai / stop ──
     if cmd == 'main':
         if parts[1] == 'open':
+            if rotasi_berjalan():
+                st['info'] = '🔄 Rotasi sedang berjalan — hentikan dulu di ⚙ Mode.'
+                return layar_utama(uid)
             if not nama:
                 return ('Belum ada akun.', [[Button.inline('➕ Tambah Akun', b'tambah:mulai')]])
             cfg = baca(nama)
@@ -740,7 +1129,9 @@ async def tangani_klik(uid, data):
             st['info'] = msg
             return layar_utama(uid)
         if parts[1] == 'stop':
-            if hentikan(nama):
+            if rotasi_berjalan():
+                st['info'] = '⏹ Rotasi dihentikan.' if hentikan_rotasi() else 'Tidak ada yang berjalan.'
+            elif hentikan(nama):
                 st['info'] = '⏹ Menghentikan...'
             else:
                 st['info'] = f'{nama} tidak sedang berjalan.'
@@ -748,6 +1139,39 @@ async def tangani_klik(uid, data):
         if parts[1] == 'batal':
             st['info'] = 'Dibatalkan.'
             return layar_utama(uid)
+
+    # ── mode (rotasi / paralel) ──
+    if cmd == 'mode':
+        if parts[1] == 'open':
+            st['flow'] = None   # sekalian membatalkan input custom delay
+            return layar_mode(uid)
+        if parts[1] == 'start':
+            try:
+                ok, msg = await mulai_rotasi()
+            except Exception as e:
+                ok, msg = False, str(e)
+            st['info'] = msg
+            return layar_mode(uid)
+        if parts[1] == 'stop':
+            st['info'] = '⏹ Rotasi dihentikan.' if hentikan_rotasi() else 'Rotasi tidak berjalan.'
+            return layar_mode(uid)
+        if parts[1] == 'set':
+            cfg_r = baca_rotasi()
+            cfg_r['delay_rotasi'] = int(parts[2]) * 60
+            simpan_rotasi(cfg_r)
+            st['info'] = f'Delay rotasi: {parts[2]} menit'
+            return layar_mode(uid)
+        if parts[1] == 'custom':
+            st['flow'] = 'modedelay'
+            return ('Kirim delay antar GILIRAN akun dalam MENIT (contoh: 45):',
+                    [[Button.inline('❌ Batal', b'mode:open')]])
+        if parts[1] == 'durasi':
+            cfg_r = baca_rotasi()
+            cfg_r['durasi_jam'] = int(parts[2])
+            cfg_r['mulai'] = time.time() if int(parts[2]) else None
+            simpan_rotasi(cfg_r)
+            st['info'] = 'Durasi rotasi: ' + ('selamanya' if int(parts[2]) == 0 else f'{parts[2]} jam')
+            return layar_mode(uid)
 
     # ── tambah akun ──
     if cmd == 'tambah':

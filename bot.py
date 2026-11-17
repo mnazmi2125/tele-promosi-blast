@@ -191,6 +191,31 @@ async def kirim_ke_grup(client, group, pesan):
         return False
 
 
+async def kirim_tanpa_tunggu(client, group, pesan, forward_info, mode_forward):
+    """Kirim ke 1 grup TANPA menunggu FloodWait — dipakai mode rotasi.
+
+    Karena mode rotasi harus langsung pindah akun saat kena flood,
+    FloodWait tidak boleh ditidurkan di sini. Mengembalikan tuple:
+
+      ('ok', 0)        -> pesan terkirim
+      ('flood', detik) -> kena FloodWait (detik = lama tunggu dari Telegram)
+      ('err', 0)       -> gagal karena alasan lain
+    """
+    try:
+        if mode_forward:
+            peer, mid = forward_info
+            await _forward(client, group, peer, mid)
+        else:
+            await _kirim(client, group, pesan)
+        return 'ok', 0
+    except FloodWaitError as e:
+        log('FLOOD', f'FloodWait {e.seconds}s saat kirim ke {group.name} -> akun di-cooldown')
+        return 'flood', int(e.seconds)
+    except Exception as e:
+        log('ERROR', f'Gagal kirim ke {group.name}: {e}')
+        return 'err', 0
+
+
 async def _forward(client, group, source_peer, message_id):
     try:
         await client.forward_messages(group.entity, message_id, from_peer=source_peer)

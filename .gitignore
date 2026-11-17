@@ -11,3 +11,7 @@ __pycache__/
 *.pyc
 .pm2/
 node_modules/
+
+# ── state mode rotasi & media blast ──
+rotasi.json
+media/
