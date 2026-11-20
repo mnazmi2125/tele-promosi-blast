@@ -49,6 +49,7 @@ ROTASI_DEFAULT = {
     'mulai': None,         # unix time rotasi dimulai (buat hitung sisa durasi)
     'giliran': None,       # akun yang mendapat giliran BERIKUTNYA
     'flood_until': {},     # nama akun -> unix time selesai cooldown flood
+    'akun_rotasi': [],     # nama akun yang DICENTANG untuk ikut rotasi
 }
 
 PANEL = {}
@@ -170,10 +171,10 @@ async def dapatkan_client(nama):
 
 
 async def mulai_blast(nama):
-    if rotasi_berjalan():
-        return False, '🔄 Rotasi sedang berjalan — hentikan dulu di menu ⚙ Mode.'
     if berjalan(nama):
         return False, f'{nama} sudah berjalan.'
+    if rotasi_berjalan() and nama in akun_rotasi_aktif():
+        return False, f'🔄 {nama} sedang dalam rotasi — keluarkan dulu di ⚙ Mode → ▸ Akun Rotasi.'
     cfg = baca(nama)
     if not cfg.get('grup'):
         return False, 'Grup belum dipilih.'
@@ -247,7 +248,13 @@ async def resume_berjalan():
             await notif(msg if ok else f'⚠️ Resume rotasi gagal: {msg}')
     except Exception as e:
         log('ERROR', f'Resume rotasi gagal: {e}')
+
+    # Akun yang sudah digerakkan rotasi tidak usah dijalankan terpisah
+    ditangani_rotasi = akun_rotasi_aktif() if rotasi_berjalan() else []
+
     for nama in daftar_akun():
+        if nama in ditangani_rotasi:
+            continue
         try:
             if baca(nama).get('running'):
                 ok, msg = await mulai_blast(nama)
@@ -270,12 +277,24 @@ def baca_rotasi():
             log('WARN', f'rotasi.json tidak terbaca ({e}) -> pakai default')
     if not isinstance(cfg.get('flood_until'), dict):
         cfg['flood_until'] = {}
+    if not isinstance(cfg.get('akun_rotasi'), list):
+        cfg['akun_rotasi'] = []
     return cfg
 
 
 def simpan_rotasi(cfg):
     with open(ROTASI_FILE, 'w') as f:
         json.dump(cfg, f, indent=2)
+
+
+def akun_rotasi_aktif(cfg_rotasi=None):
+    """Akun yang dicentang untuk rotasi DAN masih ada di daftar akun.
+
+    Akun yang sudah dihapus dari panel otomatis dibuang dari daftar giliran.
+    """
+    cfg = cfg_rotasi if cfg_rotasi is not None else baca_rotasi()
+    ada = set(daftar_akun())
+    return [n for n in (cfg.get('akun_rotasi') or []) if n in ada]
 
 
 def rotasi_berjalan():
@@ -392,10 +411,11 @@ async def jalankan_rotasi():
                 await notif('⏰ Durasi rotasi habis — blast dihentikan.')
                 break
 
-            akun = daftar_akun()
+            akun = akun_rotasi_aktif(cfg_r)
             if not akun:
-                log('WARN', 'Rotasi berhenti: tidak ada akun.')
-                await notif('⚠️ Rotasi berhenti: tidak ada akun.')
+                log('WARN', 'Rotasi berhenti: tidak ada akun dipilih.')
+                await notif('⚠️ Rotasi berhenti: tidak ada akun dipilih.\n'
+                            'Buka ⚙ Mode → ▸ Akun Rotasi lalu centang akunnya.')
                 break
 
             # ── pilih akun berikutnya yang layak ──
@@ -486,13 +506,21 @@ async def mulai_rotasi(resume=False):
     akun = daftar_akun()
     if not akun:
         return False, 'Belum ada akun.'
-    if any(berjalan(n) for n in akun):
-        return False, 'Ada akun masih jalan mode paralel — STOP dulu.'
 
     cfg_r = baca_rotasi()
-    layak = [n for n in akun if kandidat_layak(n, cfg_r)]
+    terpilih = akun_rotasi_aktif(cfg_r)
+    if not terpilih:
+        return False, ('Belum ada akun dipilih untuk rotasi.\n'
+                       'Buka ⚙ Mode → ▸ Akun Rotasi lalu centang akunnya.')
+
+    # akun terpilih tidak boleh sedang jalan mode biasa (biar tidak dobel kirim)
+    sibuk = [n for n in terpilih if berjalan(n)]
+    if sibuk:
+        return False, f'{", ".join(sibuk)} sedang jalan mode biasa — STOP dulu.'
+
+    layak = [n for n in terpilih if kandidat_layak(n, cfg_r)]
     if not layak:
-        return False, 'Tidak ada akun yang siap (cek menu Grup & session).'
+        return False, 'Akun terpilih tidak ada yang siap (cek menu Grup & session).'
 
     # pastikan pesan tiap akun valid, supaya tidak error di tengah jalan
     for n in layak:
@@ -503,14 +531,15 @@ async def mulai_rotasi(resume=False):
             return False, f'{n} tidak siap: {e}'
 
     cfg_r['running'] = True
-    if cfg_r.get('giliran') not in akun:
-        cfg_r['giliran'] = akun[0]
+    if cfg_r.get('giliran') not in terpilih:
+        cfg_r['giliran'] = terpilih[0]
     if not resume or not cfg_r.get('mulai'):
         cfg_r['mulai'] = time.time()
     simpan_rotasi(cfg_r)
 
     ROTASI_TASK['task'] = asyncio.create_task(jalankan_rotasi())
-    return True, f'🔄 Rotasi dimulai ({len(akun)} akun, jeda {txt_detik(cfg_r["delay_rotasi"])}).'
+    return True, (f'🔄 Rotasi dimulai ({len(terpilih)} akun: {", ".join(terpilih)}, '
+                  f'jeda {txt_detik(cfg_r["delay_rotasi"])}).')
 
 
 def hentikan_rotasi():
@@ -551,18 +580,19 @@ def layar_utama(uid):
     info = ambil_info(uid)
     jalan = berjalan(nama)
     roto = rotasi_berjalan()
+    ikut_rotasi = roto and nama in akun_rotasi_aktif()
     if jalan:
-        status = '🟢 Berjalan'
-    elif roto:
-        status = '🔄 Berjalan (rotasi)'
+        status = '🟢 Berjalan (mode biasa)'
+    elif ikut_rotasi:
+        status = '🔄 Digerakkan rotasi'
     else:
         status = '⏹ Berhenti'
     teks = f'🎛 PANEL KONTROL BLAST\n\nAkun aktif: {nama}\nStatus: {status}'
     if roto:
-        teks += f'\nGiliran: {baca_rotasi().get("giliran") or "-"}'
+        teks += f'\nGiliran rotasi: {baca_rotasi().get("giliran") or "-"}'
     if info:
         teks += f'\nℹ️ {info}'
-    aksi = Button.inline('⏹ STOP', b'main:stop') if (jalan or roto) else Button.inline('▶ MULAI', b'main:open')
+    aksi = Button.inline('⏹ STOP', b'main:stop') if jalan else Button.inline('▶ MULAI', b'main:open')
     tomb = [
         [Button.inline('▸ Akun', b'akun:list'), Button.inline('▸ Grup', b'grup:open')],
         [Button.inline('▸ Pesan', b'pesan:open'), Button.inline('▸ Delay & Durasi', b'delay:open')],
@@ -683,29 +713,31 @@ def layar_konfirmasi(uid):
 def layar_status(uid):
     info = ambil_info(uid)
     cfg_r = baca_rotasi() if rotasi_berjalan() else None
+    rot = akun_rotasi_aktif(cfg_r) if cfg_r is not None else []
     teks = '📊 STATUS'
     if cfg_r is not None:
-        teks += (f'\n🔄 Mode: Rotasi (giliran: {cfg_r.get("giliran") or "-"})'
-                 f'\n   Delay {txt_detik(cfg_r.get("delay_rotasi"))} | '
+        teks += (f'\n🔄 Rotasi: {len(rot)} akun ({", ".join(rot) or "-"})'
+                 f'\n   Giliran: {cfg_r.get("giliran") or "-"} | '
+                 f'{txt_detik(cfg_r.get("delay_rotasi"))} | '
                  f'Durasi {txt_jam(cfg_r.get("durasi_jam"))}')
     if info:
         teks += f'\nℹ️ {info}'
     for nama in daftar_akun():
         st = AKUN.get(nama) or {}
         if berjalan(nama):
-            baris = (f'\n\n🟢 {nama}\n   Siklus #{st.get("siklus", 0)} | terakhir {st.get("hasil", "-")} @ {st.get("terakhir", "-")}'
+            baris = (f'\n\n🟢 {nama} — mode biasa\n   Siklus #{st.get("siklus", 0)} | terakhir {st.get("hasil", "-")} @ {st.get("terakhir", "-")}'
                      f'\n   Total terkirim: {st.get("kirim", 0)}')
             if st.get('next'):
                 baris += f'\n   Siklus berikutnya ~ {st["next"].strftime("%H:%M")}'
-        elif cfg_r is not None:
+        elif nama in rot:
             gilir = '▶ GILIRAN' if nama == cfg_r.get('giliran') else '⏸ menunggu'
-            baris = (f'\n\n🔄 {nama} — {gilir}\n   Siklus #{st.get("siklus", 0)} | terakhir {st.get("hasil", "-")} @ {st.get("terakhir", "-")}'
+            baris = (f'\n\n🔄 {nama} — rotasi, {gilir}\n   Siklus #{st.get("siklus", 0)} | terakhir {st.get("hasil", "-")} @ {st.get("terakhir", "-")}'
                      f'\n   Total terkirim: {st.get("kirim", 0)}')
             until = float((cfg_r.get('flood_until') or {}).get(nama, 0) or 0)
             if until > time.time():
                 baris += f'\n   🧊 Flood cooldown {int(until - time.time())}s'
         else:
-            baris = f'\n\n⏹ {nama}: berhenti'
+            baris = f'\n\n⏹ {nama}: berhenti (di luar rotasi)'
         teks += baris
     return (teks, [[Button.inline('◀ Kembali', b'utama')]])
 
@@ -715,17 +747,22 @@ def layar_mode(uid):
     info = ambil_info(uid)
     akun = daftar_akun()
     jalan = rotasi_berjalan()
-    paralel = any(berjalan(n) for n in akun)
+    terpilih = akun_rotasi_aktif(cfg_r)
+    mode_biasa = [n for n in akun if berjalan(n)]
 
     if jalan:
         mode_txt = '🔄 Rotasi — BERJALAN'
-    elif paralel:
-        mode_txt = '⚡ Paralel — BERJALAN'
+    elif mode_biasa:
+        mode_txt = '⚡ Mode biasa berjalan'
     else:
         mode_txt = '⏸ Berhenti'
 
     teks = f'⚙ MODE\n\nMode: {mode_txt}'
-    teks += f'\nAkun         : {len(akun)}'
+    teks += f'\nAkun rotasi  : {len(terpilih)} dipilih dari {len(akun)}'
+    if terpilih:
+        teks += f'\n              ({", ".join(terpilih)})'
+    if mode_biasa:
+        teks += f'\nMode biasa   : {", ".join(mode_biasa)}'
     teks += f'\nDelay rotasi : {txt_detik(cfg_r.get("delay_rotasi"))}'
     teks += f'\nDurasi       : {txt_jam(cfg_r.get("durasi_jam"))}'
     if jalan:
@@ -742,10 +779,9 @@ def layar_mode(uid):
     tomb = []
     if jalan:
         tomb.append([Button.inline('⏹ Hentikan Rotasi', b'mode:stop')])
-    elif paralel:
-        tomb.append([Button.inline('⚡ Paralel aktif — STOP dulu', b'utama')])
     else:
-        tomb.append([Button.inline('🔄 Mulai Rotasi', b'mode:start')])
+        tomb.append([Button.inline(f'🔄 Mulai Rotasi ({len(terpilih)})', b'mode:start')])
+    tomb.append([Button.inline(f'▸ Akun Rotasi ({len(terpilih)})', b'mode:akun')])
     tomb.append([
         Button.inline('30 mnt', b'mode:set:30'),
         Button.inline('45 mnt', b'mode:set:45'),
@@ -761,10 +797,48 @@ def layar_mode(uid):
     return teks, tomb
 
 
+def layar_akun_rotasi(uid):
+    """Checkbox pemilihan akun yang ikut rotasi. Simpan langsung saat di-tap."""
+    daftar = daftar_akun()
+    cfg_r = baca_rotasi()
+    dipilih = akun_rotasi_aktif(cfg_r)
+    info = ambil_info(uid)
+
+    if not daftar:
+        return ('Belum ada akun. Tap ➕ Tambah Akun untuk login akun pertama.',
+                [[Button.inline('➕ Tambah Akun', b'tambah:mulai')],
+                 [Button.inline('◀ Kembali', b'mode:open')]])
+
+    teks = f'AKUN ROTASI: {len(dipilih)} dipilih dari {len(daftar)}\n✔ = ikut rotasi'
+    teks += '\nAkun yang tidak dicentang tetap bisa\ndipakai di mode biasa (▶ MULAI).'
+    if rotasi_berjalan():
+        teks += '\n\n⚠️ Rotasi berjalan — perubahan\nberlaku di giliran berikutnya.'
+    if info:
+        teks += f'\nℹ️ {info}'
+
+    tomb = []
+    for i in range(0, len(daftar), 2):
+        baris = []
+        for n in daftar[i:i + 2]:
+            label = ('✔ ' if n in dipilih else '▫️ ') + n[:16]
+            baris.append(Button.inline(label, f'mode:tgl:{n}'.encode()))
+        tomb.append(baris)
+    tomb.append([Button.inline('✅ Pilih Semua', b'mode:semua'),
+                 Button.inline('⬜ Kosongkan', b'mode:kosong')])
+    tomb.append([Button.inline(f'💾 Selesai ({len(dipilih)})', b'mode:open')])
+    return teks, tomb
+
+
 def terkunci(nama):
-    # Selama rotasi berjalan, semua akun dianggap terkunci karena bisa saja
-    # mendapat giliran kapan saja.
-    return berjalan(nama) or rotasi_berjalan()
+    """Kunci pengaturan akun ini.
+
+    Terkunci kalau: (a) akun punya task blast sendiri, atau (b) rotasi sedang
+    jalan DAN akun ini termasuk yang dicentang. Akun di LUAR rotasi tetap
+    bisa diedit & di-▶ MULAI selama rotasi berjalan.
+    """
+    if berjalan(nama):
+        return True
+    return rotasi_berjalan() and nama in akun_rotasi_aktif()
 
 
 # ────────────────────────── tambah akun (login dari chat) ──────────────────────────
@@ -1111,8 +1185,9 @@ async def tangani_klik(uid, data):
     # ── mulai / stop ──
     if cmd == 'main':
         if parts[1] == 'open':
-            if rotasi_berjalan():
-                st['info'] = '🔄 Rotasi sedang berjalan — hentikan dulu di ⚙ Mode.'
+            if rotasi_berjalan() and nama in akun_rotasi_aktif():
+                st['info'] = (f'🔄 {nama} sedang digerakkan rotasi.\n'
+                              'Keluarkan dulu di ⚙ Mode → ▸ Akun Rotasi.')
                 return layar_utama(uid)
             if not nama:
                 return ('Belum ada akun.', [[Button.inline('➕ Tambah Akun', b'tambah:mulai')]])
@@ -1129,10 +1204,11 @@ async def tangani_klik(uid, data):
             st['info'] = msg
             return layar_utama(uid)
         if parts[1] == 'stop':
-            if rotasi_berjalan():
-                st['info'] = '⏹ Rotasi dihentikan.' if hentikan_rotasi() else 'Tidak ada yang berjalan.'
-            elif hentikan(nama):
+            if berjalan(nama):
+                hentikan(nama)
                 st['info'] = '⏹ Menghentikan...'
+            elif rotasi_berjalan() and nama in akun_rotasi_aktif():
+                st['info'] = f'🔄 {nama} digerakkan rotasi —\nhentikan rotasi di ⚙ Mode.'
             else:
                 st['info'] = f'{nama} tidak sedang berjalan.'
             return layar_utama(uid)
@@ -1145,6 +1221,34 @@ async def tangani_klik(uid, data):
         if parts[1] == 'open':
             st['flow'] = None   # sekalian membatalkan input custom delay
             return layar_mode(uid)
+        if parts[1] == 'akun':
+            st['flow'] = None
+            return layar_akun_rotasi(uid)
+        if parts[1] == 'tgl':
+            n = parts[2]
+            cfg_r = baca_rotasi()
+            pilih = akun_rotasi_aktif(cfg_r)   # sekalian bersihkan nama yg sudah dihapus
+            if n in pilih:
+                pilih.remove(n)
+                st['info'] = f'✖ {n} dikeluarkan dari rotasi'
+            else:
+                pilih.append(n)
+                st['info'] = f'✔ {n} ikut rotasi'
+            cfg_r['akun_rotasi'] = pilih
+            simpan_rotasi(cfg_r)
+            return layar_akun_rotasi(uid)
+        if parts[1] == 'semua':
+            cfg_r = baca_rotasi()
+            cfg_r['akun_rotasi'] = daftar_akun()
+            simpan_rotasi(cfg_r)
+            st['info'] = f'Semua akun dipilih ({len(daftar_akun())})'
+            return layar_akun_rotasi(uid)
+        if parts[1] == 'kosong':
+            cfg_r = baca_rotasi()
+            cfg_r['akun_rotasi'] = []
+            simpan_rotasi(cfg_r)
+            st['info'] = 'Centang dikosongkan'
+            return layar_akun_rotasi(uid)
         if parts[1] == 'start':
             try:
                 ok, msg = await mulai_rotasi()
